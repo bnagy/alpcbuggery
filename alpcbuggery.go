@@ -29,14 +29,15 @@ type ALPCPort struct {
 	ObjectID   string
 	Name       string
 	DACL       []ACE
-	SequenceNo int
+	SequenceNo uint64
 	Everyone   bool
 }
 
 // ALPCConn represents an ALPC connection to another process / ALPC port
 type ALPCConn struct {
-	ProcessObject string
-	PortObject    string
+	DestProcess string
+	SourcePort  string
+	DestPort    string
 }
 
 // ProcessToken just holds the SID string at this point
@@ -54,7 +55,7 @@ type Process struct {
 	ObjectTable     uint64
 	HandleCount     uint64
 	Image           string
-	Label           string
+	ObjectID        string
 	Token           ProcessToken
 	Ports           []ALPCPort
 	ALPCConnections []ALPCConn
@@ -81,7 +82,7 @@ func NewDebugger(ep string) Debugger {
 
 // GetToken gets the SID for the default process token. The process could be
 // impersonating, so this is not 100% accurate.
-func (d Debugger) GetToken(tokID string) (pTok ProcessToken, e error) {
+func (d *Debugger) GetToken(tokID string) (pTok ProcessToken, e error) {
 	tokInfo, _ := d.Execute(fmt.Sprintf("!token /n %s", tokID))
 	scanner := bufio.NewScanner(strings.NewReader(tokInfo))
 
@@ -114,7 +115,7 @@ func (d Debugger) GetToken(tokID string) (pTok ProcessToken, e error) {
 }
 
 // GetProcs gets a list of all processes using the "!process 0 0" command
-func (d Debugger) GetProcs() (procList []*Process) {
+func (d *Debugger) GetProcs() (procList []*Process) {
 
 	procs, _ := d.Execute("!process 0 1")
 	scanner := bufio.NewScanner(strings.NewReader(procs))
@@ -130,7 +131,7 @@ func (d Debugger) GetProcs() (procList []*Process) {
 		//
 
 		var p Process
-		p.Label = strings.Fields(scanner.Text())[1] // PROCESS fffffa8030cc6040
+		p.ObjectID = strings.Fields(scanner.Text())[1] // PROCESS fffffa8030cc6040
 
 		scanner.Scan() //   SessionID: none  Cid: 0004    Peb: 00000000  ParentCid: 0000
 		ff := strings.Fields(scanner.Text())
@@ -169,9 +170,38 @@ func (d Debugger) GetProcs() (procList []*Process) {
 	return
 }
 
-// GetDACL gets the DACL for an ALPC port by parsing the SecurityDescriptor in
+// FillPortSeqNo parses and fills in the SequenceNo field from the output of
+// !alpc /p
+func (d *Debugger) FillPortSeqNo(port *ALPCPort) {
+	portInfo, _ := d.Execute(fmt.Sprintf("!alpc /p %s", port.ObjectID))
+	if portError.MatchString(portInfo) {
+		return
+	}
+	// lkd> !alpc /p fffffa80321c2920
+	// Port  fffffa80321c2920
+	//   Type                      : ALPC_CLIENT_COMMUNICATION_PORT
+	//   CommunicationInfo         : fffff8a002fa3150
+	//     ConnectionPort          : fffffa80340e1cd0 (DNSResolver)
+	//     ClientCommunicationPort : fffffa80321c2920
+	//     ServerCommunicationPort : fffffa8036210070
+	//   OwnerProcess              : fffffa8031d4cb30 (iexplore.exe)
+	//   SequenceNo                : 0x00000031 (49)
+	//   [...]
+	scanner := bufio.NewScanner(strings.NewReader(portInfo))
+	for scanner.Scan() {
+		ff := strings.Fields(scanner.Text())
+		if ff[0] == "SequenceNo" {
+			port.SequenceNo = mustParseUint(ff[2], 0, 0)
+			return
+		}
+	}
+	// not found
+	return
+}
+
+// FillPortDACL gets the DACL for an ALPC port by parsing the SecurityDescriptor in
 // the object header
-func (d Debugger) GetDACL(port *ALPCPort) {
+func (d *Debugger) FillPortDACL(port *ALPCPort) {
 
 	// Phase 1 - Get the Object entry for the port
 	objInfo, _ := d.Execute(fmt.Sprintf("!object %s", port.ObjectID))
@@ -234,12 +264,14 @@ func (d Debugger) GetDACL(port *ALPCPort) {
 	// ->Dacl    : ->AclSize    : 0x5c
 	// ->Dacl    : ->AceCount   : 0x4
 	// ->Dacl    : ->Sbz2       : 0x0
-	// ->Dacl    : ->Ace[0]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
-	// ->Dacl    : ->Ace[0]: ->AceFlags: 0x0
-	// ->Dacl    : ->Ace[0]: ->AceSize: 0x14
-	// ->Dacl    : ->Ace[0]: ->Mask : 0x00030001
-	// ->Dacl    : ->Ace[0]: ->SID: S-1-1-0 (Well Known Group: localhost\Everyone)
-
+	// ->Dacl    : ->Ace[1]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
+	// ->Dacl    : ->Ace[1]: ->AceFlags: 0x3
+	// ->Dacl    : ->Ace[1]:             OBJECT_INHERIT_ACE
+	// ->Dacl    : ->Ace[1]:             CONTAINER_INHERIT_ACE
+	// ->Dacl    : ->Ace[1]: ->AceSize: 0x14
+	// ->Dacl    : ->Ace[1]: ->Mask : 0x001f0001
+	// ->Dacl    : ->Ace[1]: ->SID: S-1-3-0 (Well Known Group: localhost\CREATOR OWNER)
+	//
 	// ->Dacl    : ->Ace[1]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
 	// [...more Dacls...]
 	//
@@ -253,14 +285,20 @@ func (d Debugger) GetDACL(port *ALPCPort) {
 				log.Fatalf("error parsing SID output, wanted AceType line, got %s", scanner.Text())
 			}
 			ace.Type = strings.Fields(scanner.Text())[4]
-			scanner.Scan() // ignore AceFlags
-			scanner.Scan() // ignore AceSize
+			scanner.Scan() // ignore AceFlags header line
+			for scanner.Scan() {
+				// Scan AceFlags until we hit AceSize
+				ff := strings.Fields(scanner.Text())
+				if len(ff) >= 4 && ff[3] == "->AceSize:" {
+					break
+				}
+			}
 			scanner.Scan()
 			ace.Mask = uint(mustParseUint(strings.Fields(scanner.Text())[5], 0, 0))
 			scanner.Scan()
 			ff := strings.Split(scanner.Text(), "(")
 			if len(ff) != 2 {
-				log.Fatalf("error parsing SID output, wanted SID line, got %s", scanner.Text())
+				log.Fatalf("error parsing SID output, wanted SID line, got %s\n (full output) \n %s", scanner.Text(), sdInfo)
 			}
 			ace.SID = strings.Trim(ff[1], ")")
 			if match, _ := regexp.MatchString(`Everyone`, ace.SID); match {
@@ -274,7 +312,7 @@ func (d Debugger) GetDACL(port *ALPCPort) {
 
 // GetAbsPortPath walks an ALPC port back to the root of the kernel Object
 // directory to obtain the full path
-func (d Debugger) GetAbsPortPath(port string) (absPath string) {
+func (d *Debugger) GetAbsPortPath(port string) (absPath string) {
 	stack := []string{}
 	obj := port
 	this := ""
@@ -299,17 +337,23 @@ func (d Debugger) GetAbsPortPath(port string) (absPath string) {
 		objInfo, _ := d.Execute(fmt.Sprintf("!object %s 3", obj))
 		scanner := bufio.NewScanner(strings.NewReader(objInfo))
 
-		for i := 0; i < 4; i++ {
-			scanner.Scan()
-		}
-		ff := strings.Fields(scanner.Text())
-		if len(ff) < 5 || ff[0] != "Directory" || ff[3] != "Name:" {
-			log.Fatalf("failed to get Directory / Name from: %s", scanner.Text())
-		}
+		found := false
+		for scanner.Scan() {
 
-		obj = ff[2]
-		this = strings.Join(ff[4:], " ")
-		stack = append([]string{this}, stack...)
+			ff := strings.Fields(scanner.Text())
+			if len(ff) < 5 || ff[0] != "Directory" || ff[3] != "Name:" {
+				continue
+			}
+
+			obj = ff[2]
+			this = strings.Join(ff[4:], " ")
+			stack = append([]string{this}, stack...)
+			found = true
+		}
+		if !found {
+			absPath = ""
+			return
+		}
 	}
 
 	stack[0] = "" // Just to avoid \\ for the root dir
@@ -318,19 +362,18 @@ func (d Debugger) GetAbsPortPath(port string) (absPath string) {
 
 }
 
-// GetPort gets port information for an ALPC port string from the "!alpc /lpp
-// <process>" command
-func (d Debugger) GetPort(raw string) (port ALPCPort) {
-	// fffffa8032129590('OLE16E02A5AAD974222920005479E7C')
-	ss := strings.Split(raw, "(")
-	port.ObjectID = ss[0]
+// GetPort gets port information for an ALPC port Object ID string. TODO this
+// is fragile, Object IDs must be valid.
+func (d *Debugger) GetPort(raw string) (port ALPCPort) {
+	port.ObjectID = raw
 	port.Name = d.GetAbsPortPath(port.ObjectID)
-	d.GetDACL(&port)
+	d.FillPortDACL(&port)
+	d.FillPortSeqNo(&port)
 	return
 }
 
 // GetPortDetail gets more detailed port information using the !alpc extension
-func (d Debugger) GetPortDetail(portID string) (detail string, e error) {
+func (d *Debugger) GetPortDetail(portID string) (detail string, e error) {
 
 	log.Printf("Querying port %s", portID)
 
@@ -350,9 +393,9 @@ func (d Debugger) GetPortDetail(portID string) (detail string, e error) {
 	return
 }
 
-// GetProcPorts finds all ALPC ports and connections for a process object
+// FillProcPorts finds all ALPC ports and connections for a process object
 // using "!alpc /lpp"
-func (d Debugger) GetProcPorts(proc *Process) {
+func (d *Debugger) FillProcPorts(proc *Process) {
 
 	//
 	// 	Ports created by the process fffffa80353c3060:
@@ -367,7 +410,9 @@ func (d Debugger) GetProcPorts(proc *Process) {
 	// 	fffffa80365bb8c0 0 -> fffffa803211a5a0('lsasspirpc') 0 fffffa80320a3440('lsass.exe')
 	// 	fffffa80365b2e60 0 -> fffffa8032174cf0('ntsvcs') 19 fffffa803207fb30('services.exe')
 
-	alpcInfo, _ := d.Execute(fmt.Sprintf("!alpc /lpp %s", proc.Label))
+	proc.Ports = []ALPCPort{}
+	proc.ALPCConnections = []ALPCConn{}
+	alpcInfo, _ := d.Execute(fmt.Sprintf("!alpc /lpp %s", proc.ObjectID))
 	scanner := bufio.NewScanner(strings.NewReader(alpcInfo))
 
 	for scanner.Scan() {
@@ -396,7 +441,8 @@ func (d Debugger) GetProcPorts(proc *Process) {
 			if p == "" {
 				log.Fatalf("parsing error: no connection port found in: %v", scanner.Text())
 			}
-			proc.Ports = append(proc.Ports, d.GetPort(p))
+			// fffffa8032129590('OLE16E02A5AAD974222920005479E7C')
+			proc.Ports = append(proc.Ports, d.GetPort(strings.Split(p, "(")[0]))
 			scanner.Scan()
 		}
 
@@ -407,7 +453,14 @@ func (d Debugger) GetProcPorts(proc *Process) {
 			if len(ff) == 6 && ff[2] == "->" {
 				owner := strings.Split(ff[5], "(")[0]
 				dest := strings.Split(ff[3], "(")[0]
-				proc.ALPCConnections = append(proc.ALPCConnections, ALPCConn{ProcessObject: owner, PortObject: dest})
+				proc.ALPCConnections = append(
+					proc.ALPCConnections,
+					ALPCConn{
+						DestProcess: owner,
+						DestPort:    dest,
+						SourcePort:  ff[0],
+					},
+				)
 			}
 		}
 	}
